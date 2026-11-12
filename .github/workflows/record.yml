@@ -29,7 +29,7 @@ on:
       cam:
         description: "Câmera"
         type: choice
-        options: [fusaki, kabira, kumejima]
+        options: [kokusai, prefeitura, aeroporto, malibu, kariyushi, busena, bise, miyakojima, ishigaki, cruzamento, kabira, fusaki, kumejima]
         default: fusaki
       minutes:
         description: "Minutos de gravação (1-60)"
@@ -107,12 +107,22 @@ jobs:
           MINUTES: ${{ steps.cfg.outputs.minutes }}
         run: |
           case "$CAM" in
-            fusaki)   PAGE="https://www.youtube.com/@yaeyamalive/live"; NAME="Fusaki Beach" ;;
-            kabira)   PAGE="https://www.youtube.com/@ishigaki-ch/live"; NAME="Baía de Kabira" ;;
-            kumejima) PAGE="https://www.youtube.com/channel/UCuyA_qFHnmPvl-PJUwO9hlA/live"; NAME="Kumejima · Kumi no Sato" ;;
+            kokusai)    PAGE="https://www.youtube.com/channel/UCGe19IT7lTLHURGi1yZBGRw/live"; NAME="Kokusai-dori · Makishi" ;;
+            prefeitura) PAGE="https://www.youtube.com/channel/UC-jBJkLN89AlQp6eeCNnnWg/live"; NAME="Prefeitura · Izumizaki" ;;
+            aeroporto)  PAGE="https://www.youtube.com/channel/UCl27leged0PT2kIrRtrFYKA/live"; NAME="Aeroporto de Naha" ;;
+            malibu)     PAGE="https://www.youtube.com/channel/UC8bU0LyP49R7pL49LFwsPsg/live"; NAME="Malibu Beach" ;;
+            kariyushi)  PAGE="https://www.youtube.com/channel/UCiVxzgxfn4OhuDygv5o5-mg/live"; NAME="Kariyushi Beach" ;;
+            busena)     PAGE="https://www.youtube.com/channel/UCcvSlpVp6ME4dSgzZsHI00w/live"; NAME="Busena Beach" ;;
+            bise)       PAGE="https://www.youtube.com/channel/UCa-m_22VEF-ehvxNmici1OQ/live"; NAME="Bise · Ilha Ie" ;;
+            miyakojima) PAGE="https://www.youtube.com/watch?v=EL57ZkKmAo4"; NAME="Miyakojima" ;;
+            ishigaki)   PAGE="https://www.youtube.com/channel/UCl27leged0PT2kIrRtrFYKA/live"; NAME="Ishigakijima" ;;
+            cruzamento) PAGE="https://www.youtube.com/channel/UCQJE3qm7Sjc5-JXAYjAfkrw/live"; NAME="Cruzamento 730" ;;
+            kabira)     PAGE="https://www.youtube.com/@ishigaki-ch/live"; NAME="Baía de Kabira" ;;
+            fusaki)     PAGE="https://www.youtube.com/@yaeyamalive/live"; NAME="Fusaki Beach" ;;
+            kumejima)   PAGE="https://www.youtube.com/channel/UCuyA_qFHnmPvl-PJUwO9hlA/live"; NAME="Kumejima · Kumi no Sato" ;;
+            *) echo "::error::Câmera desconhecida: $CAM"; exit 1 ;;
           esac
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          # 1ª tentativa de endereço: a própria API do app (descobre o vídeo da live).
           TARGETS=()
           RESP=$(curl -s --max-time 20 "https://webapp-jk.pages.dev/api/cam?c=${CAM}") || RESP=""
           VID=$(echo "$RESP" | python3 -c "import sys, json
@@ -128,15 +138,6 @@ jobs:
             echo "API do app não confirmou live agora: $RESP"
           fi
           TARGETS+=("$PAGE")
-          # Extração do endereço do stream (v4).
-          # (a) O yt-dlp usa os cookies da conta do robô quando o
-          # secret existe — é a chave que o próprio erro do YouTube
-          # ("Sign in to confirm you're not a bot") indica pros IPs
-          # de servidor. (b) Só vale como endereço o que começa com
-          # http: no teste nº 3 o streamlink imprimiu a mensagem de
-          # ERRO na saída padrão e o roteiro a confundiu com o
-          # endereço, e a reserva nunca rodava. (c) O manifesto HLS
-          # que a API do app às vezes traz entra como 1ª tentativa.
           COOKIES=()
           if [ -s "$GITHUB_WORKSPACE/yt-cookies.txt" ]; then
             COOKIES=(--cookies "$GITHUB_WORKSPACE/yt-cookies.txt")
@@ -152,6 +153,16 @@ jobs:
           case "$API_HLS" in
             http*) HLS="$API_HLS"; echo "Manifesto HLS veio da API do app." ;;
           esac
+          if [ -z "$HLS" ] && [ -n "$VID" ]; then
+            UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+            for pagina in "https://www.youtube.com/watch?v=$VID" "https://www.youtube-nocookie.com/embed/$VID"; do
+              for tent in 1 2 3; do
+                echo "Tentando HLS direto da página: $pagina (tentativa $tent)"
+                RAW=$(curl -s --max-time 25 -A "$UA" -H "Accept-Language: ja" "$pagina" | grep -o '"hlsManifestUrl":"[^"]*"' | head -1 | sed 's/"hlsManifestUrl":"//; s/"$//; s/\\u0026/\&/g; s/\\\//\//g') || RAW=""
+                case "$RAW" in http*) HLS="$RAW"; echo "HLS direto da página funcionou."; break 3 ;; esac
+              done
+            done
+          fi
           if [ -z "$HLS" ]; then
             for target in "${TARGETS[@]}"; do
               for client in default web_safari mweb tv_embedded ios android; do
@@ -205,9 +216,6 @@ jobs:
             printf '%s\t%s\n' "$base" "$ID" >> clips.tsv
           done
           cat clips.tsv
-          # Teto de ~500 MB POR CÂMERA: soma só os arquivos desta câmera,
-          # do mais novo pro mais antigo; o que passar do teto é apagado.
-          # Arquivos gravados nesta rodada nunca são apagados.
           rclone lsf "gdrive:OkinawaCams" --files-only --format "s;p" > all.txt
           python3 - <<'PY'
           import os
@@ -257,8 +265,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os, datetime
-          stamp = os.environ["STAMP"]  # YYYYMMDD-HHMM (JST)
-          data = f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
+          stamp = os.environ["STAMP"]
           base = datetime.datetime.strptime(stamp, "%Y%m%d-%H%M")
           total_min = int(os.environ["MINUTES"])
           apagados = set()
