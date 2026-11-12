@@ -67,10 +67,11 @@ jobs:
       - name: Instalar ferramentas
         run: |
           pip install -q yt-dlp streamlink
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           curl -sL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
           unzip -q /tmp/rclone.zip -d /tmp
           sudo cp /tmp/rclone-*/rclone /usr/local/bin/
-          ffmpeg -version | head -1
+          which ffmpeg && ffmpeg -version | head -1
           yt-dlp --version
 
       - name: Configurar o Google Drive
@@ -113,9 +114,16 @@ jobs:
             echo "API do app não confirmou live agora: $RESP"
           fi
           TARGETS+=("$PAGE")
-          # Extração do endereço do stream (yt-dlp, vários clientes; depois streamlink).
+          # Extração do endereço do stream. O streamlink vai primeiro:
+          # no teste de 12/nov ele resolveu a live a partir do servidor
+          # do GitHub, enquanto o yt-dlp tomou o bloqueio "confirme que
+          # você não é um robô" em todos os clientes. yt-dlp é a reserva.
           HLS=""
           for target in "${TARGETS[@]}"; do
+            echo "Tentando streamlink: $target"
+            HLS=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || HLS=""
+            if [ -n "$HLS" ]; then break; fi
+            tail -2 /tmp/slink.err || true
             for client in default web_safari mweb tv_embedded ios android; do
               if [ "$client" = "default" ]; then ARGS=(); else ARGS=(--extractor-args "youtube:player_client=$client"); fi
               echo "Tentando yt-dlp: $target (cliente $client)"
@@ -123,10 +131,6 @@ jobs:
               if [ -n "$HLS" ]; then break 2; fi
               tail -2 /tmp/ytdlp.err || true
             done
-            echo "Tentando streamlink: $target"
-            HLS=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || HLS=""
-            if [ -n "$HLS" ]; then break; fi
-            tail -2 /tmp/slink.err || true
           done
           if [ -z "$HLS" ]; then
             echo "::warning::Não consegui o endereço da live de $CAM (YouTube bloqueou o servidor ou a live caiu). Nada foi gravado nesta rodada."
