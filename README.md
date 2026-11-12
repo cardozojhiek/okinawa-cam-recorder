@@ -18,11 +18,14 @@ Actions + espaço gratuito do Drive.
 Também dá pra gravar na hora: **Actions → Gravar câmeras de Okinawa →
 Run workflow** (escolhe Fusaki, Kabira ou Kumejima e os minutos).
 
-## Rodízio (pra nunca encher o Drive)
+## Cortes e teto por câmera
 
-- Na pasta do Drive ficam só os **10 arquivos mais novos**; os antigos
-  são apagados sozinhos a cada gravação.
-- No manifesto ficam as últimas **30** gravações.
+- Cada gravação sai em **cortes de 5 minutos** (arquivos separados,
+  um cartão por corte no app).
+- Cada câmera tem um **teto de ~500 MB** na pasta do Drive: quando ela
+  passa do teto, os cortes mais antigos **dela** são apagados sozinhos
+  (vai sobrepondo) — as outras câmeras não são tocadas.
+- No manifesto ficam as últimas **60** gravações.
 
 ## Como funciona
 
