@@ -1,0 +1,171 @@
+name: Gravar câmeras de Okinawa
+
+# Robô gravador da box Okinawa's Cam (WebApp JK).
+# Grava trechos curtos das lives públicas, sobe pro Google Drive do dono
+# (pasta OkinawaCams, rodízio: só os 10 arquivos mais novos ficam) e
+# atualiza o recordings.json que o app lê. Custo zero: roda nos minutos
+# gratuitos do GitHub Actions e no espaço gratuito do Drive.
+#
+# Agenda (UTC; JST = UTC+9):
+#   33 8 * * *  → 17:33 JST, Fusaki Beach, 15 min (pôr do sol)
+#   0 4 * * *   → 13:00 JST, Baía de Kabira, 10 min (mar do meio-dia)
+# Manual: aba Actions → "Gravar câmeras de Okinawa" → Run workflow
+# (escolhe a câmera e os minutos).
+#
+# Segredo necessário (Settings → Secrets and variables → Actions):
+#   RCLONE_CONF_B64 — a configuração do rclone (Google Drive do dono)
+#   codificada em base64. Sem ele, a etapa do Drive falha e nada grava.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cam:
+        description: "Câmera"
+        type: choice
+        options: [fusaki, kabira, kumejima]
+        default: fusaki
+      minutes:
+        description: "Minutos de gravação (1-60)"
+        type: number
+        default: 3
+  schedule:
+    - cron: "33 8 * * *"
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: okinawa-cam-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Definir câmera e duração
+        id: cfg
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "cam=${{ inputs.cam }}" >> "$GITHUB_OUTPUT"
+            echo "minutes=${{ inputs.minutes }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 4 * * *" ]; then
+            echo "cam=kabira" >> "$GITHUB_OUTPUT"
+            echo "minutes=10" >> "$GITHUB_OUTPUT"
+          else
+            echo "cam=fusaki" >> "$GITHUB_OUTPUT"
+            echo "minutes=15" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Instalar ferramentas
+        run: |
+          pip install -q yt-dlp
+          curl -sL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp
+          sudo cp /tmp/rclone-*/rclone /usr/local/bin/
+          ffmpeg -version | head -1
+          yt-dlp --version
+
+      - name: Configurar o Google Drive
+        env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+        run: |
+          if [ -z "$RCLONE_CONF_B64" ]; then
+            echo "::error::O segredo RCLONE_CONF_B64 ainda não foi configurado — a conexão com o Drive está pendente."
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
+          rclone listremotes
+
+      - name: Resolver a live e gravar
+        id: rec
+        env:
+          CAM: ${{ steps.cfg.outputs.cam }}
+          MINUTES: ${{ steps.cfg.outputs.minutes }}
+        run: |
+          case "$CAM" in
+            fusaki)   PAGE="https://www.youtube.com/@yaeyamalive/live"; NAME="Fusaki Beach" ;;
+            kabira)   PAGE="https://www.youtube.com/@ishigaki-ch/live"; NAME="Baía de Kabira" ;;
+            kumejima) PAGE="https://www.youtube.com/channel/UCuyA_qFHnmPvl-PJUwO9hlA/live"; NAME="Kumejima · Kumi no Sato" ;;
+          esac
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          HLS=""
+          for client in web ios tv_embedded android; do
+            HLS=$(yt-dlp -g --no-warnings -f "95/94/93/best" --extractor-args "youtube:player_client=$client" "$PAGE" 2>/dev/null | head -1) || HLS=""
+            [ -n "$HLS" ] && break
+          done
+          if [ -z "$HLS" ]; then
+            echo "::warning::Sem live agora em $CAM (ou o YouTube bloqueou o IP do servidor). Nada foi gravado nesta rodada."
+            echo "gravou=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          STAMP=$(TZ=Asia/Tokyo date +%Y%m%d-%H%M)
+          FILE="${CAM}-${STAMP}.mp4"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "gravou=true" >> "$GITHUB_OUTPUT"
+          ffmpeg -hide_banner -loglevel warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
+            -i "$HLS" -t $(( MINUTES * 60 )) -c copy -movflags +faststart "$FILE"
+          ls -la "$FILE"
+
+      - name: Enviar pro Drive, gerar o link e fazer o rodízio
+        id: up
+        if: steps.rec.outputs.gravou == 'true'
+        env:
+          CAM: ${{ steps.cfg.outputs.cam }}
+          FILE: ${{ steps.rec.outputs.file }}
+        run: |
+          rclone copyto "$FILE" "gdrive:OkinawaCams/$FILE"
+          LINK=$(rclone link "gdrive:OkinawaCams/$FILE")
+          echo "Link público: $LINK"
+          ID=$(echo "$LINK" | sed -E 's/.*(id=|\/d\/)([A-Za-z0-9_-]+).*/\2/')
+          if [ -z "$ID" ] || [ "$ID" = "$LINK" ]; then echo "::error::Não consegui extrair o ID do arquivo no Drive."; exit 1; fi
+          echo "drive_id=$ID" >> "$GITHUB_OUTPUT"
+          # Rodízio: mantém só os 10 arquivos mais novos da pasta.
+          rclone lsf "gdrive:OkinawaCams" --files-only --format "t;p" | sort -r | cut -d';' -f2 | tail -n +11 | while read -r old; do
+            [ -n "$old" ] && echo "Apagando antigo: $old" && rclone deletefile "gdrive:OkinawaCams/$old"
+          done
+
+      - name: Atualizar o manifesto das gravações
+        if: steps.up.outputs.drive_id
+        env:
+          CAM: ${{ steps.cfg.outputs.cam }}
+          NAME: ${{ steps.rec.outputs.name }}
+          FILE: ${{ steps.rec.outputs.file }}
+          MINUTES: ${{ steps.cfg.outputs.minutes }}
+          DRIVE_ID: ${{ steps.up.outputs.drive_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+          jst = datetime.timezone(datetime.timedelta(hours=9))
+          now = datetime.datetime.now(jst)
+          path = "recordings.json"
+          try:
+              with open(path, encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception:
+              data = {"recordings": []}
+          recs = data.get("recordings", [])
+          recs.insert(0, {
+              "cam": os.environ["CAM"],
+              "name": os.environ["NAME"],
+              "date": now.strftime("%Y-%m-%d"),
+              "time": now.strftime("%H:%M"),
+              "minutes": int(os.environ["MINUTES"]),
+              "driveId": os.environ["DRIVE_ID"],
+              "file": os.environ["FILE"],
+          })
+          data["recordings"] = recs[:30]
+          data["updatedAt"] = now.isoformat()
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print("Manifesto:", data["recordings"][0])
+          PY
+          git config user.name "okinawa-cam-recorder"
+          git config user.email "actions@github.com"
+          git add recordings.json
+          git commit -m "Gravação: ${NAME} (${FILE})"
+          git push
