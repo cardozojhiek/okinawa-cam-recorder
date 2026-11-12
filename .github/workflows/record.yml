@@ -1,10 +1,14 @@
 name: Gravar câmeras de Okinawa
 
 # Robô gravador da box Okinawa's Cam (WebApp JK).
-# Grava trechos curtos das lives públicas, sobe pro Google Drive do dono
-# (pasta OkinawaCams, rodízio: só os 10 arquivos mais novos ficam) e
-# atualiza o recordings.json que o app lê. Custo zero: roda nos minutos
-# gratuitos do GitHub Actions e no espaço gratuito do Drive.
+# Grava trechos curtos das lives públicas, em CORTES DE 5 MINUTOS,
+# sobe pro Google Drive do dono (pasta OkinawaCams) e atualiza o
+# recordings.json que o app lê. Custo zero: roda nos minutos gratuitos
+# do GitHub Actions e no espaço gratuito do Drive.
+#
+# Teto por câmera: ~500 MB no Drive. Quando uma câmera passa do teto,
+# os cortes mais antigos DELA são apagados (vai sobrepondo), sem mexer
+# nas outras câmeras.
 #
 # Agenda (UTC; JST = UTC+9):
 #   33 8 * * *  → 17:33 JST, Fusaki Beach, 15 min (pôr do sol)
@@ -62,7 +66,7 @@ jobs:
 
       - name: Instalar ferramentas
         run: |
-          pip install -q yt-dlp
+          pip install -q yt-dlp streamlink
           curl -sL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
           unzip -q /tmp/rclone.zip -d /tmp
           sudo cp /tmp/rclone-*/rclone /usr/local/bin/
@@ -81,7 +85,7 @@ jobs:
           echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
           rclone listremotes
 
-      - name: Resolver a live e gravar
+      - name: Resolver a live e gravar em cortes de 5 min
         id: rec
         env:
           CAM: ${{ steps.cfg.outputs.cam }}
@@ -93,79 +97,170 @@ jobs:
             kumejima) PAGE="https://www.youtube.com/channel/UCuyA_qFHnmPvl-PJUwO9hlA/live"; NAME="Kumejima · Kumi no Sato" ;;
           esac
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          # 1ª tentativa de endereço: a própria API do app (descobre o vídeo da live).
+          TARGETS=()
+          RESP=$(curl -s --max-time 20 "https://webapp-jk.pages.dev/api/cam?c=${CAM}") || RESP=""
+          VID=$(echo "$RESP" | python3 -c "import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(d.get('videoId') or '' if d.get('live') else '')
+          except Exception:
+              print('')" 2>/dev/null) || VID=""
+          if [ -n "$VID" ]; then
+            echo "API do app: live em https://www.youtube.com/watch?v=$VID"
+            TARGETS+=("https://www.youtube.com/watch?v=$VID")
+          else
+            echo "API do app não confirmou live agora: $RESP"
+          fi
+          TARGETS+=("$PAGE")
+          # Extração do endereço do stream (yt-dlp, vários clientes; depois streamlink).
           HLS=""
-          for client in web ios tv_embedded android; do
-            HLS=$(yt-dlp -g --no-warnings -f "95/94/93/best" --extractor-args "youtube:player_client=$client" "$PAGE" 2>/dev/null | head -1) || HLS=""
-            [ -n "$HLS" ] && break
+          for target in "${TARGETS[@]}"; do
+            for client in default web_safari mweb tv_embedded ios android; do
+              if [ "$client" = "default" ]; then ARGS=(); else ARGS=(--extractor-args "youtube:player_client=$client"); fi
+              echo "Tentando yt-dlp: $target (cliente $client)"
+              HLS=$(yt-dlp -g --no-warnings -f "95/94/93/best" "${ARGS[@]}" "$target" 2>/tmp/ytdlp.err | head -1) || HLS=""
+              if [ -n "$HLS" ]; then break 2; fi
+              tail -2 /tmp/ytdlp.err || true
+            done
+            echo "Tentando streamlink: $target"
+            HLS=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || HLS=""
+            if [ -n "$HLS" ]; then break; fi
+            tail -2 /tmp/slink.err || true
           done
           if [ -z "$HLS" ]; then
-            echo "::warning::Sem live agora em $CAM (ou o YouTube bloqueou o IP do servidor). Nada foi gravado nesta rodada."
+            echo "::warning::Não consegui o endereço da live de $CAM (YouTube bloqueou o servidor ou a live caiu). Nada foi gravado nesta rodada."
             echo "gravou=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "Stream resolvido. Gravando $MINUTES min em cortes de 5 min..."
           STAMP=$(TZ=Asia/Tokyo date +%Y%m%d-%H%M)
-          FILE="${CAM}-${STAMP}.mp4"
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-          echo "gravou=true" >> "$GITHUB_OUTPUT"
+          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
+          mkdir -p parts
           ffmpeg -hide_banner -loglevel warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
-            -i "$HLS" -t $(( MINUTES * 60 )) -c copy -movflags +faststart "$FILE"
-          ls -la "$FILE"
+            -t $(( MINUTES * 60 )) -i "$HLS" -c copy \
+            -f segment -segment_time 300 -segment_start_number 1 -reset_timestamps 1 \
+            "parts/${CAM}-${STAMP}-p%02d.mp4" || true
+          ls -la parts/ || true
+          if ls parts/*.mp4 >/dev/null 2>&1; then
+            echo "gravou=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::A gravação não gerou nenhum corte utilizável."
+            echo "gravou=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Enviar pro Drive, gerar o link e fazer o rodízio
+      - name: Enviar pro Drive e aplicar o teto de 500 MB da câmera
         id: up
         if: steps.rec.outputs.gravou == 'true'
         env:
           CAM: ${{ steps.cfg.outputs.cam }}
-          FILE: ${{ steps.rec.outputs.file }}
         run: |
-          rclone copyto "$FILE" "gdrive:OkinawaCams/$FILE"
-          LINK=$(rclone link "gdrive:OkinawaCams/$FILE")
-          echo "Link público: $LINK"
-          ID=$(echo "$LINK" | sed -E 's/.*(id=|\/d\/)([A-Za-z0-9_-]+).*/\2/')
-          if [ -z "$ID" ] || [ "$ID" = "$LINK" ]; then echo "::error::Não consegui extrair o ID do arquivo no Drive."; exit 1; fi
-          echo "drive_id=$ID" >> "$GITHUB_OUTPUT"
-          # Rodízio: mantém só os 10 arquivos mais novos da pasta.
-          rclone lsf "gdrive:OkinawaCams" --files-only --format "t;p" | sort -r | cut -d';' -f2 | tail -n +11 | while read -r old; do
-            [ -n "$old" ] && echo "Apagando antigo: $old" && rclone deletefile "gdrive:OkinawaCams/$old"
+          : > clips.tsv
+          for f in parts/*.mp4; do
+            base=$(basename "$f")
+            rclone copyto "$f" "gdrive:OkinawaCams/$base"
+            LINK=$(rclone link "gdrive:OkinawaCams/$base")
+            echo "Link público de $base: $LINK"
+            ID=$(echo "$LINK" | sed -E 's/.*(id=|\/d\/)([A-Za-z0-9_-]+).*/\2/')
+            if [ -z "$ID" ] || [ "$ID" = "$LINK" ]; then echo "::error::Não consegui extrair o ID de $base no Drive."; exit 1; fi
+            printf '%s\t%s\n' "$base" "$ID" >> clips.tsv
           done
+          cat clips.tsv
+          # Teto de ~500 MB POR CÂMERA: soma só os arquivos desta câmera,
+          # do mais novo pro mais antigo; o que passar do teto é apagado.
+          # Arquivos gravados nesta rodada nunca são apagados.
+          rclone lsf "gdrive:OkinawaCams" --files-only --format "s;p" > all.txt
+          python3 - <<'PY'
+          import os
+          cam = os.environ["CAM"]
+          cap = 500 * 1024 * 1024
+          novos = set()
+          try:
+              with open("clips.tsv", encoding="utf-8") as fh:
+                  for linha in fh:
+                      partes = linha.rstrip("\n").split("\t")
+                      if partes and partes[0]:
+                          novos.add(partes[0])
+          except FileNotFoundError:
+              pass
+          itens = []
+          with open("all.txt", encoding="utf-8") as fh:
+              for linha in fh:
+                  linha = linha.strip()
+                  if not linha:
+                      continue
+                  size, _, path = linha.partition(";")
+                  if path.startswith(cam + "-"):
+                      itens.append((path, int(size)))
+          itens.sort(key=lambda x: x[0], reverse=True)
+          total = 0
+          apagar = []
+          for path, size in itens:
+              total += size
+              if total > cap and path not in novos:
+                  apagar.append(path)
+          with open("deleted.txt", "w", encoding="utf-8") as fh:
+              for path in apagar:
+                  fh.write(path + "\n")
+          print(f"{cam}: {len(itens)} arquivo(s), total {total/1048576:.1f} MB, teto 500 MB, apagando {len(apagar)} antigo(s).")
+          PY
+          while read -r old; do
+            [ -n "$old" ] && echo "Apagando antigo: $old" && rclone deletefile "gdrive:OkinawaCams/$old"
+          done < deleted.txt
 
       - name: Atualizar o manifesto das gravações
-        if: steps.up.outputs.drive_id
+        if: steps.rec.outputs.gravou == 'true'
         env:
           CAM: ${{ steps.cfg.outputs.cam }}
           NAME: ${{ steps.rec.outputs.name }}
-          FILE: ${{ steps.rec.outputs.file }}
+          STAMP: ${{ steps.rec.outputs.stamp }}
           MINUTES: ${{ steps.cfg.outputs.minutes }}
-          DRIVE_ID: ${{ steps.up.outputs.drive_id }}
         run: |
           python3 - <<'PY'
           import json, os, datetime
-          jst = datetime.timezone(datetime.timedelta(hours=9))
-          now = datetime.datetime.now(jst)
+          stamp = os.environ["STAMP"]  # YYYYMMDD-HHMM (JST)
+          data = f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
+          base = datetime.datetime.strptime(stamp, "%Y%m%d-%H%M")
+          total_min = int(os.environ["MINUTES"])
+          apagados = set()
+          try:
+              with open("deleted.txt", encoding="utf-8") as fh:
+                  apagados = {l.strip() for l in fh if l.strip()}
+          except FileNotFoundError:
+              pass
+          novos = []
+          with open("clips.tsv", encoding="utf-8") as fh:
+              for i, linha in enumerate(fh):
+                  partes = linha.rstrip("\n").split("\t")
+                  if len(partes) < 2:
+                      continue
+                  inicio = base + datetime.timedelta(minutes=5 * i)
+                  novos.append({
+                      "cam": os.environ["CAM"],
+                      "name": os.environ["NAME"],
+                      "date": inicio.strftime("%Y-%m-%d"),
+                      "time": inicio.strftime("%H:%M"),
+                      "minutes": max(1, min(5, total_min - 5 * i)),
+                      "driveId": partes[1],
+                      "file": partes[0],
+                  })
           path = "recordings.json"
           try:
-              with open(path, encoding="utf-8") as f:
-                  data = json.load(f)
+              with open(path, encoding="utf-8") as fh:
+                  dados = json.load(fh)
           except Exception:
-              data = {"recordings": []}
-          recs = data.get("recordings", [])
-          recs.insert(0, {
-              "cam": os.environ["CAM"],
-              "name": os.environ["NAME"],
-              "date": now.strftime("%Y-%m-%d"),
-              "time": now.strftime("%H:%M"),
-              "minutes": int(os.environ["MINUTES"]),
-              "driveId": os.environ["DRIVE_ID"],
-              "file": os.environ["FILE"],
-          })
-          data["recordings"] = recs[:30]
-          data["updatedAt"] = now.isoformat()
-          with open(path, "w", encoding="utf-8") as f:
-              json.dump(data, f, ensure_ascii=False, indent=2)
-          print("Manifesto:", data["recordings"][0])
+              dados = {"recordings": []}
+          recs = [r for r in dados.get("recordings", []) if r.get("file") not in apagados]
+          recs.extend(novos)
+          recs.sort(key=lambda r: (r.get("date", ""), r.get("time", "")), reverse=True)
+          dados["recordings"] = recs[:60]
+          dados["updatedAt"] = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat()
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(dados, fh, ensure_ascii=False, indent=2)
+          print(f"Manifesto: {len(dados['recordings'])} gravação(ões); novas: {len(novos)}; removidas pelo teto: {len(apagados)}")
           PY
           git config user.name "okinawa-cam-recorder"
           git config user.email "actions@github.com"
           git add recordings.json
-          git commit -m "Gravação: ${NAME} (${FILE})"
+          git commit -m "Gravação: ${NAME} (${STAMP})"
           git push
