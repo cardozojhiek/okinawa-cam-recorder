@@ -10,11 +10,16 @@ name: Gravar câmeras de Okinawa
 # os cortes mais antigos DELA são apagados (vai sobrepondo), sem mexer
 # nas outras câmeras.
 #
-# Agenda (UTC; JST = UTC+9):
-#   33 8 * * *  → 17:33 JST, Fusaki Beach, 15 min (pôr do sol)
-#   0 4 * * *   → 13:00 JST, Baía de Kabira, 10 min (mar do meio-dia)
+# Agenda: quem manda é o DONO, no app (Emulador → Okinawa's Cam →
+# Robô gravador): por câmera — ligada ou não, minutos por gravação,
+# até 3 horários e os dias da semana. Este workflow acorda a cada
+# 15 minutos, lê a agenda em https://webapp-jk.pages.dev/api/camcfg
+# e grava as câmeras "da vez" (|agora − horário| < 15 min, sem
+# repetir o mesmo horário no mesmo dia — controle em
+# recorder-state.json). Sem resposta da agenda, valem os padrões:
+# Fusaki 17:30 · 15 min e Kabira 13:00 · 10 min, todo dia.
 # Manual: aba Actions → "Gravar câmeras de Okinawa" → Run workflow
-# (escolhe a câmera e os minutos).
+# (escolhe a câmera e os minutos; ignora a agenda).
 #
 # Segredos necessários (Settings → Secrets and variables → Actions):
 #   RCLONE_CONF_B64 — a configuração do rclone (Google Drive do dono)
@@ -36,8 +41,7 @@ on:
         type: number
         default: 3
   schedule:
-    - cron: "33 8 * * *"
-    - cron: "0 4 * * *"
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: write
@@ -53,21 +57,60 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Definir câmera e duração
+      - name: Definir as câmeras da vez
         id: cfg
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "cam=${{ inputs.cam }}" >> "$GITHUB_OUTPUT"
-            echo "minutes=${{ inputs.minutes }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 4 * * *" ]; then
-            echo "cam=kabira" >> "$GITHUB_OUTPUT"
-            echo "minutes=10" >> "$GITHUB_OUTPUT"
+            printf '%s %s manual\n' "${{ inputs.cam }}" "${{ inputs.minutes }}" > due.txt
+            echo "Modo manual: ${{ inputs.cam }} por ${{ inputs.minutes }} min."
           else
-            echo "cam=fusaki" >> "$GITHUB_OUTPUT"
-            echo "minutes=15" >> "$GITHUB_OUTPUT"
+            python3 - <<'PY'
+          import json, urllib.request, datetime
+          JST = datetime.timezone(datetime.timedelta(hours=9))
+          now = datetime.datetime.now(JST)
+          try:
+              with urllib.request.urlopen("https://webapp-jk.pages.dev/api/camcfg", timeout=20) as r:
+                  cfg = json.load(r)["config"]
+              print("Agenda lida da /api/camcfg.")
+          except Exception as e:
+              cfg = {"enabled": True, "cams": {"fusaki": {"on": True, "minutes": 15, "times": ["17:30"], "days": [0, 1, 2, 3, 4, 5, 6]}, "kabira": {"on": True, "minutes": 10, "times": ["13:00"], "days": [0, 1, 2, 3, 4, 5, 6]}}}
+              print("Agenda indisponível, usando os padrões:", e)
+          js_day = (now.weekday() + 1) % 7
+          try:
+              with open("recorder-state.json", encoding="utf-8") as fh:
+                  state = json.load(fh)
+          except Exception:
+              state = {}
+          today = now.strftime("%Y-%m-%d")
+          fired = set((state.get("fired") or {}).get(today, []))
+          due = []
+          if cfg.get("enabled"):
+              for cam, c in (cfg.get("cams") or {}).items():
+                  if not c or not c.get("on"):
+                      continue
+                  if js_day not in (c.get("days") or []):
+                      continue
+                  for t in (c.get("times") or []):
+                      try:
+                          hh, mm = int(t[:2]), int(t[3:5])
+                      except Exception:
+                          continue
+                      slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                      key = f"{cam}@{t}"
+                      if abs((now - slot).total_seconds()) < 900 and key not in fired:
+                          due.append((cam, int(c.get("minutes") or 10), key))
+                          print(f"Na vez: {cam} — {c.get('minutes')} min (horário {t})")
+          with open("due.txt", "w", encoding="utf-8") as fh:
+              for cam, minutes, key in due:
+                  fh.write(f"{cam} {minutes} {key}\n")
+          print(f"Total na vez: {len(due)}")
+          PY
           fi
+          echo "count=$(grep -c . due.txt || true)" >> "$GITHUB_OUTPUT"
+          cat due.txt
 
       - name: Instalar ferramentas
+        if: steps.cfg.outputs.count != '0'
         run: |
           pip install -q yt-dlp streamlink
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
@@ -78,6 +121,7 @@ jobs:
           yt-dlp --version
 
       - name: Configurar o Google Drive
+        if: steps.cfg.outputs.count != '0'
         env:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
         run: |
@@ -90,6 +134,7 @@ jobs:
           rclone listremotes
 
       - name: Cookies do YouTube (conta do robô)
+        if: steps.cfg.outputs.count != '0'
         env:
           YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
         run: |
@@ -100,130 +145,120 @@ jobs:
             echo "Sem o secret YT_COOKIES_TXT — a extração pode bater no muro anti-robô do YouTube."
           fi
 
-      - name: Resolver a live e gravar em cortes de 5 min
-        id: rec
-        env:
-          CAM: ${{ steps.cfg.outputs.cam }}
-          MINUTES: ${{ steps.cfg.outputs.minutes }}
+      - name: Gravar as câmeras da vez (cortes de 5 min, Drive e teto)
+        if: steps.cfg.outputs.count != '0'
         run: |
-          case "$CAM" in
-            kokusai)    PAGE="https://www.youtube.com/channel/UCGe19IT7lTLHURGi1yZBGRw/live"; NAME="Kokusai-dori · Makishi" ;;
-            prefeitura) PAGE="https://www.youtube.com/channel/UC-jBJkLN89AlQp6eeCNnnWg/live"; NAME="Prefeitura · Izumizaki" ;;
-            aeroporto)  PAGE="https://www.youtube.com/channel/UCl27leged0PT2kIrRtrFYKA/live"; NAME="Aeroporto de Naha" ;;
-            malibu)     PAGE="https://www.youtube.com/channel/UC8bU0LyP49R7pL49LFwsPsg/live"; NAME="Malibu Beach" ;;
-            kariyushi)  PAGE="https://www.youtube.com/channel/UCiVxzgxfn4OhuDygv5o5-mg/live"; NAME="Kariyushi Beach" ;;
-            busena)     PAGE="https://www.youtube.com/channel/UCcvSlpVp6ME4dSgzZsHI00w/live"; NAME="Busena Beach" ;;
-            bise)       PAGE="https://www.youtube.com/channel/UCa-m_22VEF-ehvxNmici1OQ/live"; NAME="Bise · Ilha Ie" ;;
-            miyakojima) PAGE="https://www.youtube.com/watch?v=EL57ZkKmAo4"; NAME="Miyakojima" ;;
-            ishigaki)   PAGE="https://www.youtube.com/channel/UCl27leged0PT2kIrRtrFYKA/live"; NAME="Ishigakijima" ;;
-            cruzamento) PAGE="https://www.youtube.com/channel/UCQJE3qm7Sjc5-JXAYjAfkrw/live"; NAME="Cruzamento 730" ;;
-            kabira)     PAGE="https://www.youtube.com/@ishigaki-ch/live"; NAME="Baía de Kabira" ;;
-            fusaki)     PAGE="https://www.youtube.com/@yaeyamalive/live"; NAME="Fusaki Beach" ;;
-            kumejima)   PAGE="https://www.youtube.com/channel/UCuyA_qFHnmPvl-PJUwO9hlA/live"; NAME="Kumejima · Kumi no Sato" ;;
-            *) echo "::error::Câmera desconhecida: $CAM"; exit 1 ;;
-          esac
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          TARGETS=()
-          RESP=$(curl -s --max-time 20 "https://webapp-jk.pages.dev/api/cam?c=${CAM}") || RESP=""
-          VID=$(echo "$RESP" | python3 -c "import sys, json
-          try:
-              d = json.load(sys.stdin)
-              print(d.get('videoId') or '' if d.get('live') else '')
-          except Exception:
-              print('')" 2>/dev/null) || VID=""
-          if [ -n "$VID" ]; then
-            echo "API do app: live em https://www.youtube.com/watch?v=$VID"
-            TARGETS+=("https://www.youtube.com/watch?v=$VID")
-          else
-            echo "API do app não confirmou live agora: $RESP"
-          fi
-          TARGETS+=("$PAGE")
           COOKIES=()
           if [ -s "$GITHUB_WORKSPACE/yt-cookies.txt" ]; then
             COOKIES=(--cookies "$GITHUB_WORKSPACE/yt-cookies.txt")
             echo "yt-dlp vai usar os cookies da conta do robô."
           fi
-          HLS=""
-          API_HLS=$(echo "$RESP" | python3 -c "import sys, json
+          while read -r CAM MINUTES KEY; do
+            [ -n "$CAM" ] || continue
+            case "$CAM" in
+              kokusai)    PAGE="https://www.youtube.com/channel/UCGe19IT7lTLHURGi1yZBGRw/live"; NAME="Kokusai-dori · Makishi" ;;
+              prefeitura) PAGE="https://www.youtube.com/channel/UC-jBJkLN89AlQp6eeCNnnWg/live"; NAME="Prefeitura · Izumizaki" ;;
+              aeroporto)  PAGE="https://www.youtube.com/channel/UCl27leged0PT2kIrRtrFYKA/live"; NAME="Aeroporto de Naha" ;;
+              malibu)     PAGE="https://www.youtube.com/channel/UC8bU0LyP49R7pL49LFwsPsg/live"; NAME="Malibu Beach" ;;
+              kariyushi)  PAGE="https://www.youtube.com/channel/UCiVxzgxfn4OhuDygv5o5-mg/live"; NAME="Kariyushi Beach" ;;
+              busena)     PAGE="https://www.youtube.com/channel/UCcvSlpVp6ME4dSgzZsHI00w/live"; NAME="Busena Beach" ;;
+              bise)       PAGE="https://www.youtube.com/channel/UCa-m_22VEF-ehvxNmici1OQ/live"; NAME="Bise · Ilha Ie" ;;
+              miyakojima) PAGE="https://www.youtube.com/watch?v=EL57ZkKmAo4"; NAME="Miyakojima" ;;
+              ishigaki)   PAGE="https://www.youtube.com/channel/UCl27leged0PT2kIrRtrFYKA/live"; NAME="Ishigakijima" ;;
+              cruzamento) PAGE="https://www.youtube.com/channel/UCQJE3qm7Sjc5-JXAYjAfkrw/live"; NAME="Cruzamento 730" ;;
+              kabira)     PAGE="https://www.youtube.com/@ishigaki-ch/live"; NAME="Baía de Kabira" ;;
+              fusaki)     PAGE="https://www.youtube.com/@yaeyamalive/live"; NAME="Fusaki Beach" ;;
+              kumejima)   PAGE="https://www.youtube.com/channel/UCuyA_qFHnmPvl-PJUwO9hlA/live"; NAME="Kumejima · Kumi no Sato" ;;
+              *) echo "::warning::Câmera desconhecida na agenda: $CAM"; continue ;;
+            esac
+            echo "===== $NAME ($CAM) — $MINUTES min ====="
+            TARGETS=()
+            RESP=$(curl -s --max-time 20 "https://webapp-jk.pages.dev/api/cam?c=${CAM}") || RESP=""
+            VID=$(echo "$RESP" | python3 -c "import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(d.get('videoId') or '' if d.get('live') else '')
+          except Exception:
+              print('')" 2>/dev/null) || VID=""
+            if [ -n "$VID" ]; then
+              echo "API do app: live em https://www.youtube.com/watch?v=$VID"
+              TARGETS+=("https://www.youtube.com/watch?v=$VID")
+            else
+              echo "API do app não confirmou live agora: $RESP"
+            fi
+            TARGETS+=("$PAGE")
+            HLS=""
+            API_HLS=$(echo "$RESP" | python3 -c "import sys, json
           try:
               d = json.load(sys.stdin)
               print(d.get('hlsUrl') or '' if d.get('live') else '')
           except Exception:
               print('')" 2>/dev/null) || API_HLS=""
-          case "$API_HLS" in
-            http*) HLS="$API_HLS"; echo "Manifesto HLS veio da API do app." ;;
-          esac
-          if [ -z "$HLS" ] && [ -n "$VID" ]; then
-            UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
-            for pagina in "https://www.youtube.com/watch?v=$VID" "https://www.youtube-nocookie.com/embed/$VID"; do
-              for tent in 1 2 3; do
-                echo "Tentando HLS direto da página: $pagina (tentativa $tent)"
-                RAW=$(curl -s --max-time 25 -A "$UA" -H "Accept-Language: ja" "$pagina" | grep -o '"hlsManifestUrl":"[^"]*"' | head -1 | sed 's/"hlsManifestUrl":"//; s/"$//; s/\\u0026/\&/g; s/\\\//\//g') || RAW=""
-                case "$RAW" in http*) HLS="$RAW"; echo "HLS direto da página funcionou."; break 3 ;; esac
+            case "$API_HLS" in
+              http*) HLS="$API_HLS"; echo "Manifesto HLS veio da API do app." ;;
+            esac
+            if [ -z "$HLS" ] && [ -n "$VID" ]; then
+              UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+              for pagina in "https://www.youtube.com/watch?v=$VID" "https://www.youtube-nocookie.com/embed/$VID"; do
+                for tent in 1 2 3; do
+                  echo "Tentando HLS direto da página: $pagina (tentativa $tent)"
+                  RAW=$(curl -s --max-time 25 -A "$UA" -H "Accept-Language: ja" "$pagina" | grep -o '"hlsManifestUrl":"[^"]*"' | head -1 | sed 's/"hlsManifestUrl":"//; s/"$//; s/\\u0026/\&/g; s/\\\//\//g') || RAW=""
+                  case "$RAW" in http*) HLS="$RAW"; echo "HLS direto da página funcionou."; break 3 ;; esac
+                done
               done
-            done
-          fi
-          if [ -z "$HLS" ]; then
-            for target in "${TARGETS[@]}"; do
-              for client in default web_safari mweb tv_embedded ios android; do
-                if [ "$client" = "default" ]; then ARGS=(); else ARGS=(--extractor-args "youtube:player_client=$client"); fi
-                echo "Tentando yt-dlp: $target (cliente $client)"
-                OUT=$(yt-dlp -g --no-warnings -f "95/94/93/best" "${COOKIES[@]}" "${ARGS[@]}" "$target" 2>/tmp/ytdlp.err | head -1) || OUT=""
-                case "$OUT" in http*) HLS="$OUT"; break 2 ;; esac
-                tail -2 /tmp/ytdlp.err || true
+            fi
+            if [ -z "$HLS" ]; then
+              for target in "${TARGETS[@]}"; do
+                for client in default web_safari mweb tv_embedded ios android; do
+                  if [ "$client" = "default" ]; then ARGS=(); else ARGS=(--extractor-args "youtube:player_client=$client"); fi
+                  echo "Tentando yt-dlp: $target (cliente $client)"
+                  OUT=$(yt-dlp -g --no-warnings -f "95/94/93/best" "${COOKIES[@]}" "${ARGS[@]}" "$target" 2>/tmp/ytdlp.err | head -1) || OUT=""
+                  case "$OUT" in http*) HLS="$OUT"; break 2 ;; esac
+                  tail -2 /tmp/ytdlp.err || true
+                done
+                echo "Tentando streamlink: $target"
+                OUT=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || OUT=""
+                case "$OUT" in http*) HLS="$OUT"; break ;; esac
+                tail -2 /tmp/slink.err || true
               done
-              echo "Tentando streamlink: $target"
-              OUT=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || OUT=""
-              case "$OUT" in http*) HLS="$OUT"; break ;; esac
-              tail -2 /tmp/slink.err || true
+            fi
+            if [ -z "$HLS" ]; then
+              echo "::warning::Não consegui o endereço da live de $CAM (YouTube bloqueou o servidor ou a live caiu). Nada foi gravado nesta rodada."
+              continue
+            fi
+            echo "Stream resolvido. Gravando $MINUTES min em cortes de 5 min..."
+            STAMP=$(TZ=Asia/Tokyo date +%Y%m%d-%H%M)
+            mkdir -p parts
+            rm -f parts/*.mp4
+            ffmpeg -hide_banner -loglevel warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
+              -t $(( MINUTES * 60 )) -i "$HLS" -c copy \
+              -f segment -segment_time 300 -segment_start_number 1 -reset_timestamps 1 \
+              "parts/${CAM}-${STAMP}-p%02d.mp4" || true
+            ls -la parts/ || true
+            if ! ls parts/*.mp4 >/dev/null 2>&1; then
+              echo "::warning::A gravação de $CAM não gerou nenhum corte utilizável."
+              continue
+            fi
+            printf '%s|%s|%s\n' "$NAME" "$STAMP" "$MINUTES" > "meta-$CAM.txt"
+            : > "clips-$CAM.tsv"
+            for f in parts/*.mp4; do
+              base=$(basename "$f")
+              rclone copyto "$f" "gdrive:OkinawaCams/$base"
+              LINK=$(rclone link "gdrive:OkinawaCams/$base")
+              echo "Link público de $base: $LINK"
+              ID=$(echo "$LINK" | sed -E 's/.*(id=|\/d\/)([A-Za-z0-9_-]+).*/\2/')
+              if [ -z "$ID" ] || [ "$ID" = "$LINK" ]; then echo "::error::Não consegui extrair o ID de $base no Drive."; exit 1; fi
+              printf '%s\t%s\n' "$base" "$ID" >> "clips-$CAM.tsv"
             done
-          fi
-          if [ -z "$HLS" ]; then
-            echo "::warning::Não consegui o endereço da live de $CAM (YouTube bloqueou o servidor ou a live caiu). Nada foi gravado nesta rodada."
-            echo "gravou=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "Stream resolvido. Gravando $MINUTES min em cortes de 5 min..."
-          STAMP=$(TZ=Asia/Tokyo date +%Y%m%d-%H%M)
-          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
-          mkdir -p parts
-          ffmpeg -hide_banner -loglevel warning -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
-            -t $(( MINUTES * 60 )) -i "$HLS" -c copy \
-            -f segment -segment_time 300 -segment_start_number 1 -reset_timestamps 1 \
-            "parts/${CAM}-${STAMP}-p%02d.mp4" || true
-          ls -la parts/ || true
-          if ls parts/*.mp4 >/dev/null 2>&1; then
-            echo "gravou=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::A gravação não gerou nenhum corte utilizável."
-            echo "gravou=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Enviar pro Drive e aplicar o teto de 500 MB da câmera
-        id: up
-        if: steps.rec.outputs.gravou == 'true'
-        env:
-          CAM: ${{ steps.cfg.outputs.cam }}
-        run: |
-          : > clips.tsv
-          for f in parts/*.mp4; do
-            base=$(basename "$f")
-            rclone copyto "$f" "gdrive:OkinawaCams/$base"
-            LINK=$(rclone link "gdrive:OkinawaCams/$base")
-            echo "Link público de $base: $LINK"
-            ID=$(echo "$LINK" | sed -E 's/.*(id=|\/d\/)([A-Za-z0-9_-]+).*/\2/')
-            if [ -z "$ID" ] || [ "$ID" = "$LINK" ]; then echo "::error::Não consegui extrair o ID de $base no Drive."; exit 1; fi
-            printf '%s\t%s\n' "$base" "$ID" >> clips.tsv
-          done
-          cat clips.tsv
-          rclone lsf "gdrive:OkinawaCams" --files-only --format "s;p" > all.txt
-          python3 - <<'PY'
+            cat "clips-$CAM.tsv"
+            rclone lsf "gdrive:OkinawaCams" --files-only --format "s;p" > "all-$CAM.txt"
+            CAM="$CAM" python3 - <<'PY'
           import os
           cam = os.environ["CAM"]
           cap = 500 * 1024 * 1024
           novos = set()
           try:
-              with open("clips.tsv", encoding="utf-8") as fh:
+              with open(f"clips-{cam}.tsv", encoding="utf-8") as fh:
                   for linha in fh:
                       partes = linha.rstrip("\n").split("\t")
                       if partes and partes[0]:
@@ -231,7 +266,7 @@ jobs:
           except FileNotFoundError:
               pass
           itens = []
-          with open("all.txt", encoding="utf-8") as fh:
+          with open(f"all-{cam}.txt", encoding="utf-8") as fh:
               for linha in fh:
                   linha = linha.strip()
                   if not linha:
@@ -246,50 +281,49 @@ jobs:
               total += size
               if total > cap and path not in novos:
                   apagar.append(path)
-          with open("deleted.txt", "w", encoding="utf-8") as fh:
+          with open(f"deleted-{cam}.txt", "w", encoding="utf-8") as fh:
               for path in apagar:
                   fh.write(path + "\n")
           print(f"{cam}: {len(itens)} arquivo(s), total {total/1048576:.1f} MB, teto 500 MB, apagando {len(apagar)} antigo(s).")
           PY
-          while read -r old; do
-            [ -n "$old" ] && echo "Apagando antigo: $old" && rclone deletefile "gdrive:OkinawaCams/$old"
-          done < deleted.txt
+            while read -r old; do
+              [ -n "$old" ] && echo "Apagando antigo: $old" && rclone deletefile "gdrive:OkinawaCams/$old"
+            done < "deleted-$CAM.txt"
+          done < due.txt
 
-      - name: Atualizar o manifesto das gravações
-        if: steps.rec.outputs.gravou == 'true'
-        env:
-          CAM: ${{ steps.cfg.outputs.cam }}
-          NAME: ${{ steps.rec.outputs.name }}
-          STAMP: ${{ steps.rec.outputs.stamp }}
-          MINUTES: ${{ steps.cfg.outputs.minutes }}
+      - name: Atualizar o manifesto e o estado da agenda
         run: |
           python3 - <<'PY'
-          import json, os, datetime
-          stamp = os.environ["STAMP"]
-          base = datetime.datetime.strptime(stamp, "%Y%m%d-%H%M")
-          total_min = int(os.environ["MINUTES"])
+          import json, os, glob, datetime
           apagados = set()
-          try:
-              with open("deleted.txt", encoding="utf-8") as fh:
-                  apagados = {l.strip() for l in fh if l.strip()}
-          except FileNotFoundError:
-              pass
+          for fn in glob.glob("deleted-*.txt"):
+              with open(fn, encoding="utf-8") as fh:
+                  apagados |= {l.strip() for l in fh if l.strip()}
           novos = []
-          with open("clips.tsv", encoding="utf-8") as fh:
-              for i, linha in enumerate(fh):
-                  partes = linha.rstrip("\n").split("\t")
-                  if len(partes) < 2:
-                      continue
-                  inicio = base + datetime.timedelta(minutes=5 * i)
-                  novos.append({
-                      "cam": os.environ["CAM"],
-                      "name": os.environ["NAME"],
-                      "date": inicio.strftime("%Y-%m-%d"),
-                      "time": inicio.strftime("%H:%M"),
-                      "minutes": max(1, min(5, total_min - 5 * i)),
-                      "driveId": partes[1],
-                      "file": partes[0],
-                  })
+          for tsv in glob.glob("clips-*.tsv"):
+              cam = tsv[len("clips-"):-len(".tsv")]
+              try:
+                  with open(f"meta-{cam}.txt", encoding="utf-8") as fh:
+                      name, stamp, minutes = fh.read().strip().split("|")
+              except Exception:
+                  continue
+              base = datetime.datetime.strptime(stamp, "%Y%m%d-%H%M")
+              total_min = int(minutes)
+              with open(tsv, encoding="utf-8") as fh:
+                  for i, linha in enumerate(fh):
+                      partes = linha.rstrip("\n").split("\t")
+                      if len(partes) < 2:
+                          continue
+                      inicio = base + datetime.timedelta(minutes=5 * i)
+                      novos.append({
+                          "cam": cam,
+                          "name": name,
+                          "date": inicio.strftime("%Y-%m-%d"),
+                          "time": inicio.strftime("%H:%M"),
+                          "minutes": max(1, min(5, total_min - 5 * i)),
+                          "driveId": partes[1],
+                          "file": partes[0],
+                      })
           path = "recordings.json"
           try:
               with open(path, encoding="utf-8") as fh:
@@ -304,9 +338,40 @@ jobs:
           with open(path, "w", encoding="utf-8") as fh:
               json.dump(dados, fh, ensure_ascii=False, indent=2)
           print(f"Manifesto: {len(dados['recordings'])} gravação(ões); novas: {len(novos)}; removidas pelo teto: {len(apagados)}")
+          JST = datetime.timezone(datetime.timedelta(hours=9))
+          today = datetime.datetime.now(JST).strftime("%Y-%m-%d")
+          try:
+              with open("recorder-state.json", encoding="utf-8") as fh:
+                  st = json.load(fh)
+          except Exception:
+              st = {}
+          fired = st.setdefault("fired", {})
+          hoje = set(fired.get(today, []))
+          try:
+              with open("due.txt", encoding="utf-8") as fh:
+                  for linha in fh:
+                      partes = linha.split()
+                      if len(partes) >= 3 and partes[2] != "manual":
+                          hoje.add(partes[2])
+          except FileNotFoundError:
+              pass
+          fired[today] = sorted(hoje)
+          for d in list(fired.keys()):
+              try:
+                  if (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(d)).days > 7:
+                      del fired[d]
+              except Exception:
+                  pass
+          with open("recorder-state.json", "w", encoding="utf-8") as fh:
+              json.dump(st, fh, ensure_ascii=False, indent=2)
+          print("Estado da agenda atualizado.")
           PY
           git config user.name "okinawa-cam-recorder"
           git config user.email "actions@github.com"
-          git add recordings.json
-          git commit -m "Gravação: ${NAME} (${STAMP})"
-          git push
+          git add recordings.json recorder-state.json
+          if git diff --cached --quiet; then
+            echo "Nada novo pra gravar no repositório."
+          else
+            git commit -m "Gravações/estado: $(TZ=Asia/Tokyo date +%Y-%m-%d' '%H:%M)"
+            git push
+          fi
