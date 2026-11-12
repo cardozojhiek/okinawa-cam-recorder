@@ -16,9 +16,12 @@ name: Gravar câmeras de Okinawa
 # Manual: aba Actions → "Gravar câmeras de Okinawa" → Run workflow
 # (escolhe a câmera e os minutos).
 #
-# Segredo necessário (Settings → Secrets and variables → Actions):
+# Segredos necessários (Settings → Secrets and variables → Actions):
 #   RCLONE_CONF_B64 — a configuração do rclone (Google Drive do dono)
 #   codificada em base64. Sem ele, a etapa do Drive falha e nada grava.
+#   YT_COOKIES_TXT — os cookies do YouTube da conta Google do robô
+#   (formato cookies.txt). É a chave contra o bloqueio "confirme que
+#   você não é um robô" que o YouTube impõe a IPs de servidor.
 
 on:
   workflow_dispatch:
@@ -86,6 +89,17 @@ jobs:
           echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
           rclone listremotes
 
+      - name: Cookies do YouTube (conta do robô)
+        env:
+          YT_COOKIES_TXT: ${{ secrets.YT_COOKIES_TXT }}
+        run: |
+          if [ -n "$YT_COOKIES_TXT" ]; then
+            printf '%s' "$YT_COOKIES_TXT" > "$GITHUB_WORKSPACE/yt-cookies.txt"
+            echo "Cookies do robô presentes: $(grep -c 'youtube\.com' "$GITHUB_WORKSPACE/yt-cookies.txt" || true) linha(s) do YouTube."
+          else
+            echo "Sem o secret YT_COOKIES_TXT — a extração pode bater no muro anti-robô do YouTube."
+          fi
+
       - name: Resolver a live e gravar em cortes de 5 min
         id: rec
         env:
@@ -114,24 +128,45 @@ jobs:
             echo "API do app não confirmou live agora: $RESP"
           fi
           TARGETS+=("$PAGE")
-          # Extração do endereço do stream. O streamlink vai primeiro:
-          # no teste de 12/nov ele resolveu a live a partir do servidor
-          # do GitHub, enquanto o yt-dlp tomou o bloqueio "confirme que
-          # você não é um robô" em todos os clientes. yt-dlp é a reserva.
+          # Extração do endereço do stream (v4).
+          # (a) O yt-dlp usa os cookies da conta do robô quando o
+          # secret existe — é a chave que o próprio erro do YouTube
+          # ("Sign in to confirm you're not a bot") indica pros IPs
+          # de servidor. (b) Só vale como endereço o que começa com
+          # http: no teste nº 3 o streamlink imprimiu a mensagem de
+          # ERRO na saída padrão e o roteiro a confundiu com o
+          # endereço, e a reserva nunca rodava. (c) O manifesto HLS
+          # que a API do app às vezes traz entra como 1ª tentativa.
+          COOKIES=()
+          if [ -s "$GITHUB_WORKSPACE/yt-cookies.txt" ]; then
+            COOKIES=(--cookies "$GITHUB_WORKSPACE/yt-cookies.txt")
+            echo "yt-dlp vai usar os cookies da conta do robô."
+          fi
           HLS=""
-          for target in "${TARGETS[@]}"; do
-            echo "Tentando streamlink: $target"
-            HLS=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || HLS=""
-            if [ -n "$HLS" ]; then break; fi
-            tail -2 /tmp/slink.err || true
-            for client in default web_safari mweb tv_embedded ios android; do
-              if [ "$client" = "default" ]; then ARGS=(); else ARGS=(--extractor-args "youtube:player_client=$client"); fi
-              echo "Tentando yt-dlp: $target (cliente $client)"
-              HLS=$(yt-dlp -g --no-warnings -f "95/94/93/best" "${ARGS[@]}" "$target" 2>/tmp/ytdlp.err | head -1) || HLS=""
-              if [ -n "$HLS" ]; then break 2; fi
-              tail -2 /tmp/ytdlp.err || true
+          API_HLS=$(echo "$RESP" | python3 -c "import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(d.get('hlsUrl') or '' if d.get('live') else '')
+          except Exception:
+              print('')" 2>/dev/null) || API_HLS=""
+          case "$API_HLS" in
+            http*) HLS="$API_HLS"; echo "Manifesto HLS veio da API do app." ;;
+          esac
+          if [ -z "$HLS" ]; then
+            for target in "${TARGETS[@]}"; do
+              for client in default web_safari mweb tv_embedded ios android; do
+                if [ "$client" = "default" ]; then ARGS=(); else ARGS=(--extractor-args "youtube:player_client=$client"); fi
+                echo "Tentando yt-dlp: $target (cliente $client)"
+                OUT=$(yt-dlp -g --no-warnings -f "95/94/93/best" "${COOKIES[@]}" "${ARGS[@]}" "$target" 2>/tmp/ytdlp.err | head -1) || OUT=""
+                case "$OUT" in http*) HLS="$OUT"; break 2 ;; esac
+                tail -2 /tmp/ytdlp.err || true
+              done
+              echo "Tentando streamlink: $target"
+              OUT=$(streamlink --stream-url "$target" best 2>/tmp/slink.err | head -1) || OUT=""
+              case "$OUT" in http*) HLS="$OUT"; break ;; esac
+              tail -2 /tmp/slink.err || true
             done
-          done
+          fi
           if [ -z "$HLS" ]; then
             echo "::warning::Não consegui o endereço da live de $CAM (YouTube bloqueou o servidor ou a live caiu). Nada foi gravado nesta rodada."
             echo "gravou=false" >> "$GITHUB_OUTPUT"
